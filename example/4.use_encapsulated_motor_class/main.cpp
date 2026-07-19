@@ -5,7 +5,7 @@ class MyRobot : public librmcs::client::CBoard {
 public:
     explicit MyRobot(int32_t usb_pid = -1)
         : CBoard(usb_pid)
-        , motor_(librmcs::device::DjiMotor::Config{librmcs::device::DjiMotor::Type::M3508})
+        , motor_(librmcs::device::DjiMotor::Config{librmcs::device::DjiMotor::Type::M2006})
         , transmit_buffer_(*this, 16) {}
 
 private:
