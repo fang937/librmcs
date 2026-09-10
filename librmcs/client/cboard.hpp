@@ -93,6 +93,10 @@ protected:
         (void)uart_data;
         (void)uart_data_length;
     }
+    virtual void servo_receive_callback(const std::byte* servo_data, uint8_t servo_data_length) {
+        (void)servo_data;
+        (void)servo_data_length;
+    }
 
     virtual void accelerometer_receive_callback(int16_t x, int16_t y, int16_t z) {
         (void)x;
@@ -276,6 +280,30 @@ private:
             return;
         }
 
+        if (!usb_receive_seen_) {
+            usb_receive_seen_ = true;
+            LOG_INFO(
+                "USB RX frame detected: length=%d first=0x%02x",
+                transfer->actual_length, static_cast<uint8_t>(*iterator));
+        }
+
+        // Servo firmware may return a single field directly (8D + payload), while
+        // other firmware versions wrap fields in the usual AE upward frame.
+        if (*iterator == std::byte{0x8D}) {
+            if (transfer->actual_length != 1 + 8) [[unlikely]] {
+                LOG_ERROR("USB receiving error: Invalid servo response length: %d!",
+                    transfer->actual_length);
+                return;
+            }
+            read_servo_buffer(iterator);
+            if (iterator != sentinel) [[unlikely]] {
+                LOG_ERROR("USB receiving error: Unexpected data after servo response!");
+                return;
+            }
+            debug_print_buffer.disable();
+            return;
+        }
+
         if (*iterator != std::byte{0xAE}) [[unlikely]] {
             LOG_ERROR(
                 "USB receiving error: Unexpected header: 0x%02x!", static_cast<uint8_t>(*iterator));
@@ -304,6 +332,8 @@ private:
                 read_uart_buffer(iterator, &CBoard::uart2_receive_callback);
             } else if (field_id == UpwardId::UART3) {
                 read_uart_buffer(iterator, &CBoard::dbus_receive_callback);
+            } else if (field_id == UpwardId::SERVO) {
+                read_servo_buffer(iterator);
             } else if (field_id == UpwardId::IMU) {
                 read_imu_buffer(iterator);
             } else if (field_id == UpwardId::GPIO) {
@@ -373,6 +403,16 @@ private:
         buffer += size;
     }
 
+    void read_servo_buffer(std::byte*& buffer) {
+        auto& header = *std::launder(reinterpret_cast<UartFieldHeader*>(buffer));
+        buffer += sizeof(UartFieldHeader);
+        uint8_t size = header.data_size;
+        if (!size)
+            size = static_cast<uint8_t>(*buffer++);
+        servo_receive_callback(buffer, size);
+        buffer += size;
+    }
+
     void read_imu_buffer(std::byte*& buffer) {
         auto& field = *std::launder(reinterpret_cast<ImuField*>(buffer));
         buffer += sizeof(ImuField);
@@ -411,6 +451,7 @@ private:
         UART6 = 10,
 
         IMU = 11,
+        SERVO = 13,
     };
 
     enum class DownwardId : uint8_t {
@@ -431,6 +472,7 @@ private:
 
         LED = 11,
         BUZZER = 12,
+        SERVO = 13,
     };
 
     PACKED_STRUCT(CanFieldHeader {
@@ -519,6 +561,7 @@ private:
 
     std::atomic<bool> handling_events_ = false;
     bool receive_transfer_busy_ = false;
+    bool usb_receive_seen_ = false;
 };
 
 class CBoard::TransmitBuffer final {
@@ -610,6 +653,29 @@ public:
 
     bool add_uart2_transmission(const std::byte* uart_data, uint8_t uart_data_length) {
         return add_uart_transmission(DownwardId::UART2, uart_data, uart_data_length);
+    }
+
+    bool add_servo_transmission(const std::byte* servo_data, uint8_t servo_data_length) {
+        // A servo command is one protocol packet. Keep its field and payload in
+        // the same USB frame instead of using the UART chunking path.
+        if (!servo_data || servo_data_length == 0 || servo_data_length > 15)
+            return false;
+
+        constexpr std::size_t field_size = sizeof(UartFieldHeader);
+        const auto required_size = field_size + servo_data_length;
+        std::byte* buffer = try_fetch_buffer(required_size);
+        if (!buffer) {
+            trigger_transmission_nocheck();
+            buffer = try_fetch_buffer(required_size);
+        }
+        if (!buffer)
+            return false;
+
+        auto& header = *new (buffer) UartFieldHeader{};
+        header.field_id = static_cast<uint8_t>(DownwardId::SERVO);
+        header.data_size = servo_data_length;
+        std::memcpy(buffer + field_size, servo_data, servo_data_length);
+        return true;
     }
 
     bool add_dbus_transmission(const std::byte* uart_data, uint8_t uart_data_length) {
